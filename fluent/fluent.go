@@ -8,8 +8,9 @@ import (
 	"net"
 	"reflect"
 	"strconv"
-	"sync"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 const (
@@ -22,6 +23,7 @@ const (
 	defaultRetryWait              = 500
 	defaultMaxRetry               = 13
 	defaultReconnectWaitIncreRate = 1.5
+	defaultSyncPost               = false
 )
 
 type Config struct {
@@ -34,14 +36,16 @@ type Config struct {
 	RetryWait        int
 	MaxRetry         int
 	TagPrefix        string
+	SyncPost         bool
 }
 
 type Fluent struct {
 	Config
-	conn         io.WriteCloser
-	pending      []byte
-	reconnecting bool
-	mu           sync.Mutex
+	conn   io.WriteCloser
+	buf    []byte
+	postCh chan []byte
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New creates a new Logger.
@@ -70,8 +74,21 @@ func New(config Config) (f *Fluent, err error) {
 	if config.MaxRetry == 0 {
 		config.MaxRetry = defaultMaxRetry
 	}
-	f = &Fluent{Config: config, reconnecting: false}
-	err = f.connect()
+	if config.SyncPost == false {
+		config.SyncPost = defaultSyncPost
+	}
+	f = &Fluent{
+		Config: config,
+		postCh: make(chan []byte),
+	}
+
+	f.ctx, f.cancel = context.WithCancel(context.Background())
+
+	if err = f.connect(); err != nil {
+		return
+	}
+	go f.spooler(f.ctx)
+
 	return
 }
 
@@ -148,27 +165,22 @@ func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) err
 }
 
 func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}) error {
-	if data, dumperr := f.EncodeData(tag, tm, message); dumperr != nil {
+	data, dumperr := f.EncodeData(tag, tm, message)
+	if dumperr != nil {
 		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%s' to msgpack:%s", message, dumperr)
 		// fmt.Println("fluent#Post: can't convert to msgpack:", message, dumperr)
-	} else {
-		f.PostRawData(data)
-		return nil
 	}
+	if f.SyncPost {
+		return f.send(data)
+	}
+	f.PostRawData(data)
+	return nil
 }
 
 func (f *Fluent) PostRawData(data []byte) {
-	f.mu.Lock()
-	f.pending = append(f.pending, data...)
-	f.mu.Unlock()
-	if err := f.send(); err != nil {
-		f.close()
-		if len(f.pending) > f.Config.BufferLimit {
-			f.flushBuffer()
-		}
-	} else {
-		f.flushBuffer()
-	}
+	var buf []byte
+	copy(buf, f.buf)
+	f.postCh <- buf
 }
 
 func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data []byte, err error) {
@@ -180,25 +192,17 @@ func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data
 
 // Close closes the connection.
 func (f *Fluent) Close() (err error) {
-	if len(f.pending) > 0 {
-		err = f.send()
-	}
-	f.close()
-	return
+	f.cancel()
+	return nil
 }
 
 // close closes the connection.
 func (f *Fluent) close() (err error) {
-	if f.conn != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-	} else {
+	if f.conn == nil {
 		return
 	}
-	if f.conn != nil {
-		f.conn.Close()
-		f.conn = nil
-	}
+	f.conn.Close()
+	f.conn = nil
 	return
 }
 
@@ -224,40 +228,67 @@ func (f *Fluent) reconnect() {
 		for i := 0; ; i++ {
 			err := f.connect()
 			if err == nil {
-				f.mu.Lock()
-				f.reconnecting = false
-				f.mu.Unlock()
 				break
-			} else {
-				if i == f.Config.MaxRetry {
-					panic("fluent#reconnect: failed to reconnect!")
-				}
-				waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
-				time.Sleep(time.Duration(waitTime) * time.Millisecond)
 			}
+			if i == f.Config.MaxRetry {
+				panic("fluent#reconnect: failed to reconnect!")
+			}
+			waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
+			time.Sleep(time.Duration(waitTime) * time.Millisecond)
 		}
 	}()
 }
 
 func (f *Fluent) flushBuffer() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pending = f.pending[0:0]
+	f.buf = f.buf[0:0]
 }
 
-func (f *Fluent) send() (err error) {
+func (f *Fluent) send(data []byte) (err error) {
 	if f.conn == nil {
-		if f.reconnecting == false {
-			f.mu.Lock()
-			f.reconnecting = true
-			f.mu.Unlock()
-			f.reconnect()
-		}
-		err = errors.New("fluent#send: can't send logs, client is reconnecting")
-	} else {
-		f.mu.Lock()
-		_, err = f.conn.Write(f.pending)
-		f.mu.Unlock()
+		f.reconnect()
 	}
+	_, err = f.conn.Write(f.buf)
 	return
+}
+
+func (f *Fluent) spooler(ctx context.Context) {
+	senderResult := make(chan error)
+	sendChCh := f.sender(ctx, senderResult)
+	for {
+		select {
+		case data := <-f.postCh:
+			f.buf = append(f.buf, data...)
+			if len(f.buf) > f.Config.BufferLimit {
+				f.flushBuffer()
+			}
+		case sendCh := <-sendChCh:
+			var buf []byte
+			copy(buf, f.buf)
+			f.flushBuffer()
+			sendCh <- buf
+		case <-ctx.Done():
+			<-senderResult
+			f.send(f.buf)
+			f.flushBuffer()
+			f.close()
+			return
+		}
+	}
+}
+func (f *Fluent) sender(ctx context.Context, result chan error) chan chan []byte {
+	sendCh := make(chan chan []byte)
+	go func() {
+		bufCh := make(chan []byte)
+		for {
+			sendCh <- bufCh
+			select {
+			case data := <-bufCh:
+				f.send(data)
+			case <-ctx.Done():
+				result <- ctx.Err()
+				return
+			}
+		}
+	}()
+	return sendCh
 }

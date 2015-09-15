@@ -112,16 +112,19 @@ func Test_New_itShouldUseConfigValuesFromArguments(t *testing.T) {
 }
 
 func Test_send_WritePendingToConn(t *testing.T) {
-	f := &Fluent{Config: Config{}, reconnecting: false}
+	f := &Fluent{
+		Config: Config{},
+		postCh: make(chan []byte),
+	}
 
 	buf := &Conn{}
 	f.conn = buf
 
 	msg := "This is test writing."
 	bmsg := []byte(msg)
-	f.pending = append(f.pending, bmsg...)
+	f.buf = append(f.buf, bmsg...)
 
-	err := f.send()
+	err := f.send(f.buf)
 	if err != nil {
 		t.Error(err)
 	}
