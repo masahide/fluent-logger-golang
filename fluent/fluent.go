@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 const (
@@ -42,6 +44,11 @@ type Fluent struct {
 	pending      []byte
 	reconnecting bool
 	mu           sync.Mutex
+	addCh        chan []byte
+	sendCh       chan chan []byte
+	errCh        chan error
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // New creates a new Logger.
@@ -70,8 +77,21 @@ func New(config Config) (f *Fluent, err error) {
 	if config.MaxRetry == 0 {
 		config.MaxRetry = defaultMaxRetry
 	}
-	f = &Fluent{Config: config, reconnecting: false}
-	err = f.connect()
+	f = &Fluent{
+		Config:       config,
+		reconnecting: false,
+		sendCh:       make(chan chan []byte),
+		addCh:        make(chan []byte),
+		errCh:        make(chan error),
+	}
+
+	f.ctx, f.cancel = context.WithCancel(context.Background())
+
+	if err = f.connect(); err != nil {
+		return
+	}
+	go f.spooler()
+
 	return
 }
 
@@ -245,19 +265,41 @@ func (f *Fluent) flushBuffer() {
 	f.pending = f.pending[0:0]
 }
 
-func (f *Fluent) send() (err error) {
+func (f *Fluent) send(data []byte) (err error) {
 	if f.conn == nil {
-		if f.reconnecting == false {
-			f.mu.Lock()
-			f.reconnecting = true
-			f.mu.Unlock()
-			f.reconnect()
-		}
-		err = errors.New("fluent#send: can't send logs, client is reconnecting")
-	} else {
-		f.mu.Lock()
-		_, err = f.conn.Write(f.pending)
-		f.mu.Unlock()
+		f.reconnect()
 	}
+	_, err = f.conn.Write(f.pending)
 	return
+}
+
+func (f *Fluent) spooler() {
+	for {
+		select {
+		case data := <-f.addCh:
+			f.pending = append(f.pending, data...)
+			if len(f.pending) > f.Config.BufferLimit {
+				f.flushBuffer()
+			}
+		case sendCh := <-f.sendCh:
+			var buf []byte
+			copy(buf, f.pending)
+			f.flushBuffer()
+			sendCh <- buf
+		case <-f.ctx.Done():
+			return
+		}
+	}
+}
+func (f *Fluent) sender() {
+	bufCh := make(chan []byte)
+	for {
+		f.sendCh <- bufCh
+		select {
+		case data := <-f.bufCh:
+			f.send(data)
+		case <-f.ctx.Done():
+			return
+		}
+	}
 }
