@@ -44,6 +44,7 @@ type Fluent struct {
 	conn   io.WriteCloser
 	buf    []byte
 	postCh chan []byte
+	result chan error
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -80,6 +81,7 @@ func New(config Config) (f *Fluent, err error) {
 	f = &Fluent{
 		Config: config,
 		postCh: make(chan []byte),
+		result: make(chan error),
 	}
 
 	f.ctx, f.cancel = context.WithCancel(context.Background())
@@ -178,8 +180,8 @@ func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}
 }
 
 func (f *Fluent) PostRawData(data []byte) {
-	var buf []byte
-	copy(buf, f.buf)
+	buf := make([]byte, len(data))
+	copy(buf, data)
 	f.postCh <- buf
 }
 
@@ -193,7 +195,7 @@ func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data
 // Close closes the connection.
 func (f *Fluent) Close() (err error) {
 	f.cancel()
-	return nil
+	return <-f.result
 }
 
 // close closes the connection.
@@ -224,19 +226,17 @@ func e(x, y float64) int {
 }
 
 func (f *Fluent) reconnect() {
-	go func() {
-		for i := 0; ; i++ {
-			err := f.connect()
-			if err == nil {
-				break
-			}
-			if i == f.Config.MaxRetry {
-				panic("fluent#reconnect: failed to reconnect!")
-			}
-			waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
-			time.Sleep(time.Duration(waitTime) * time.Millisecond)
+	for i := 0; ; i++ {
+		err := f.connect()
+		if err == nil {
+			break
 		}
-	}()
+		if i == f.Config.MaxRetry {
+			panic("fluent#reconnect: failed to reconnect!")
+		}
+		waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
+		time.Sleep(time.Duration(waitTime) * time.Millisecond)
+	}
 }
 
 func (f *Fluent) flushBuffer() {
@@ -244,33 +244,41 @@ func (f *Fluent) flushBuffer() {
 }
 
 func (f *Fluent) send(data []byte) (err error) {
-	if f.conn == nil {
-		f.reconnect()
+	for {
+		if f.conn == nil {
+			f.reconnect()
+		}
+		if _, err = f.conn.Write(data); err == nil {
+			return
+		}
+		f.close()
 	}
-	_, err = f.conn.Write(f.buf)
-	return
 }
 
 func (f *Fluent) spooler(ctx context.Context) {
 	senderResult := make(chan error)
 	sendChCh := f.sender(ctx, senderResult)
 	for {
+		var receive chan chan []byte
+		if len(f.buf) > 0 {
+			receive = sendChCh
+		}
 		select {
 		case data := <-f.postCh:
 			f.buf = append(f.buf, data...)
 			if len(f.buf) > f.Config.BufferLimit {
 				f.flushBuffer()
 			}
-		case sendCh := <-sendChCh:
-			var buf []byte
+		case sendCh := <-receive:
+			buf := make([]byte, len(f.buf))
 			copy(buf, f.buf)
 			f.flushBuffer()
 			sendCh <- buf
 		case <-ctx.Done():
 			<-senderResult
-			f.send(f.buf)
-			f.flushBuffer()
+			err := f.send(f.buf)
 			f.close()
+			f.result <- err
 			return
 		}
 	}
@@ -280,7 +288,12 @@ func (f *Fluent) sender(ctx context.Context, result chan error) chan chan []byte
 	go func() {
 		bufCh := make(chan []byte)
 		for {
-			sendCh <- bufCh
+			select {
+			case sendCh <- bufCh:
+			case <-ctx.Done():
+				result <- ctx.Err()
+				return
+			}
 			select {
 			case data := <-bufCh:
 				f.send(data)
